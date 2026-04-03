@@ -1,0 +1,1180 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║        AutoDock Vina — Enhanced Molecular Docking Pipeline              ║
+║  Idempotent · Debian/Ubuntu + Fedora/RHEL/CentOS · Python 3.8+          ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  Features                                                               ║
+║  ─────────────────────────────────────────────────────────────────────  ║
+║  • Protonation / charge assignment                                      ║
+║      Receptor : pdb2pqr + PROPKA  (pH-aware, AMBER/CHARMM FF)           ║
+║      Ligands  : AM1-BCC via antechamber  →  Gasteiger fallback          ║
+║  • Grid box optimization                                                ║
+║      Auto     : fpocket cavity detection  →  ranked pocket list         ║
+║      Semi-auto: reference-ligand geometric centroid + padding           ║
+║      Manual   : explicit GRID_CENTER / GRID_SIZE override               ║
+║  • Flexible receptor residues                                           ║
+║      meeko mk_prepare_receptor  →  ADT prepare_flexreceptor4 fallback   ║
+║      Automatic rigid / flex PDBQT splitting                             ║
+║  • Multiple runs + exhaustiveness tuning                                ║
+║      Seed sweep across N independent runs, best-of-N aggregation        ║
+║      Exhaustiveness ladder with convergence detection                   ║
+║      Per-run RMSD clustering to identify stable binding modes           ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+Usage
+─────
+  python3 vina_docking_pipeline.py
+  python3 vina_docking_pipeline.py --skip-install --debug
+  python3 vina_docking_pipeline.py --pocket 2          # use fpocket pocket #2
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ★  USER CONFIGURATION  ★   ← only section you need to edit
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Receptor ────────────────────────────────────────────────────────────────
+PROTEIN_FILE    = "protein.pdb"      # Path to receptor PDB file
+RECEPTOR_PH     = 7.4                # pH for protonation (PROPKA)
+RECEPTOR_FF     = "AMBER"            # Force field: AMBER | CHARMM | PARSE | TYL06
+
+# ── Ligands ─────────────────────────────────────────────────────────────────
+# Mix of file paths (SDF / MOL2 / PDB) and/or raw SMILES strings.
+LIGANDS = [
+    "ligand_aspirin.sdf",
+    "CC(=O)Oc1ccccc1C(=O)O",                  # Aspirin SMILES
+    "ligand_ibuprofen.mol2",
+    "CC(C)Cc1ccc(cc1)C(C)C(=O)O",             # Ibuprofen SMILES
+    "ligand_caffeine.pdb",
+]
+
+# Optional friendly names for SMILES entries (index-matched; "" = auto-name)
+SMILES_NAMES = ["", "Aspirin", "", "Ibuprofen", ""]
+
+# ── Charge assignment for ligands ────────────────────────────────────────────
+# "am1bcc"   – AM1-BCC via antechamber (AmberTools, most accurate)
+# "gasteiger" – Gasteiger via Open Babel (fast, always available)
+# "auto"     – try AM1-BCC, fall back to Gasteiger
+LIGAND_CHARGE_METHOD = "auto"
+
+# ── Grid box ─────────────────────────────────────────────────────────────────
+# GRID_MODE options:
+#   "manual"    – use GRID_CENTER + GRID_SIZE exactly as given
+#   "fpocket"   – auto-detect via fpocket (install fpocket first)
+#   "reference" – center on REFERENCE_LIGAND file (SDF/PDB/PDBQT)
+GRID_MODE        = "manual"
+GRID_CENTER      = (0.0, 0.0, 0.0)   # (x, y, z) Å  – used in "manual" mode
+GRID_SIZE        = (20.0, 20.0, 20.0) # (x, y, z) Å  – used in "manual" mode
+GRID_PADDING     = 8.0               # Å padding added around reference ligand
+FPOCKET_POCKET   = 1                 # which fpocket pocket rank to use (1 = best)
+REFERENCE_LIGAND = ""                # path to reference ligand for "reference" mode
+
+# ── Flexible residues ────────────────────────────────────────────────────────
+# Format: "ChainID:ResName:ResNum"  e.g. "A:TYR:50"
+# Leave empty to use a fully rigid receptor.
+FLEXIBLE_RESIDUES = [
+    # "A:TYR:50",
+    # "A:PHE:103",
+    # "A:ASP:189",
+]
+
+# ── Multiple runs + exhaustiveness tuning ────────────────────────────────────
+NUM_RUNS             = 3             # independent docking runs per ligand
+EXHAUSTIVENESS       = 8            # base exhaustiveness (used for each run)
+NUM_MODES            = 9            # max poses per run
+ENERGY_RANGE         = 3            # kcal/mol window above best pose
+
+# Exhaustiveness ladder: set to [] to disable.
+# Script runs each level and stops when best affinity converges.
+EXHAUSTIVENESS_LADDER   = [4, 8, 16, 32]
+CONVERGENCE_THRESHOLD   = 0.3       # kcal/mol — stop ladder when Δ < this
+LADDER_ENABLED          = False     # set True to activate ladder sweep
+
+# ── Output ───────────────────────────────────────────────────────────────────
+OUTPUT_DIR  = "docking_output"      # created automatically
+
+# ── Advanced ─────────────────────────────────────────────────────────────────
+CPU_CORES   = 0                     # 0 = all available cores
+RMSD_CLUSTER_CUTOFF = 2.0           # Å – poses closer than this are clustered
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  END OF USER CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import math
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+LOG_FMT = "%(asctime)s  %(levelname)-8s  %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt="%H:%M:%S")
+log = logging.getLogger("vina-pipeline")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run(cmd: List[str], *, check: bool = True,
+         capture: bool = False, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+    log.debug("$ %s", " ".join(str(c) for c in cmd))
+    return subprocess.run(cmd, check=check, capture_output=capture,
+                          text=True, cwd=cwd)
+
+
+def _is_cmd(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def _is_smiles(s: str) -> bool:
+    p = Path(s)
+    if p.suffix.lower() in (".sdf", ".mol", ".mol2", ".pdb", ".pdbqt", ".xyz", ".pqr"):
+        return False
+    if p.exists():
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OS / PACKAGE-MANAGER DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_os() -> str:
+    if Path("/etc/debian_version").exists():
+        return "debian"
+    if Path("/etc/fedora-release").exists() or Path("/etc/redhat-release").exists():
+        return "rpm"
+    try:
+        txt = Path("/etc/os-release").read_text()
+        if any(k in txt.lower() for k in ("ubuntu", "debian", "mint", "pop")):
+            return "debian"
+        if any(k in txt.lower() for k in ("fedora", "rhel", "centos", "rocky", "alma")):
+            return "rpm"
+    except FileNotFoundError:
+        pass
+    return "unknown"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IDEMPOTENT DEPENDENCY INSTALLATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DEBIAN_PKGS = [
+    "python3-pip",
+    "openbabel",
+    "python3-openbabel",
+    "pdb2pqr",           # protonation via PROPKA
+    "fpocket",           # cavity detection (may need PPA)
+    "ambertools",        # antechamber for AM1-BCC (optional, large)
+]
+
+_RPM_PKGS = [
+    "python3-pip",
+    "openbabel",
+    "openbabel-python",
+    # pdb2pqr, fpocket → installed via pip/source below
+]
+
+_PIP_PKGS = {
+    "vina":   "vina",
+    "meeko":  "meeko>=0.5.0",
+    "rdkit":  "rdkit",
+    "pdb2pqr":"pdb2pqr",        # cross-platform fallback
+    "scipy":  "scipy",           # RMSD clustering
+    "numpy":  "numpy",
+}
+
+
+def _pip_installed(import_name: str) -> bool:
+    try:
+        __import__(import_name)
+        return True
+    except ImportError:
+        return False
+
+
+def install_system_deps(os_family: str) -> None:
+    log.info("── System dependencies (%s) ──", os_family)
+    if os_family == "debian":
+        _run(["sudo", "apt-get", "update", "-qq"])
+        # Core packages only (skip large optional ones that may not exist)
+        safe_pkgs = ["python3-pip", "openbabel", "python3-openbabel", "pdb2pqr"]
+        for pkg in safe_pkgs:
+            r = _run(["dpkg", "-s", pkg], check=False, capture=True)
+            if r.returncode == 0:
+                log.info("  [ok] %-30s already installed", pkg)
+            else:
+                log.info("  [+]  installing %-25s …", pkg)
+                _run(["sudo", "apt-get", "install", "-y", "-qq", pkg], check=False)
+        # fpocket separately (may not be in default repos on all versions)
+        r = _run(["dpkg", "-s", "fpocket"], check=False, capture=True)
+        if r.returncode != 0:
+            log.info("  [~]  fpocket not in apt — will use pip/source if needed")
+
+    elif os_family == "rpm":
+        pm = "dnf" if _is_cmd("dnf") else "yum"
+        safe_pkgs = ["python3-pip", "openbabel", "openbabel-python"]
+        for pkg in safe_pkgs:
+            r = _run([pm, "list", "installed", pkg], check=False, capture=True)
+            if r.returncode == 0:
+                log.info("  [ok] %-30s already installed", pkg)
+            else:
+                log.info("  [+]  installing %-25s …", pkg)
+                _run(["sudo", pm, "install", "-y", pkg], check=False)
+    else:
+        log.warning("Unknown OS — skipping system package install.")
+
+
+def install_python_deps() -> None:
+    log.info("── Python dependencies ──")
+    for imp, pkg in _PIP_PKGS.items():
+        if _pip_installed(imp):
+            log.info("  [ok] %-20s already installed", pkg.split(">=")[0])
+        else:
+            log.info("  [+]  pip install %-20s …", pkg)
+            _run([sys.executable, "-m", "pip", "install", "--quiet", pkg])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROTONATION & CHARGE ASSIGNMENT — RECEPTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def protonate_receptor(pdb_path: Path, out_dir: Path) -> Path:
+    """
+    Stage 1 of receptor prep: add hydrogens at the target pH.
+
+    Priority:
+      1. pdb2pqr (CLI) with PROPKA — full pH-aware titration of all residues
+      2. obabel -p flag — fast but pH-unaware (no pKa calculation)
+
+    Returns path to a protonated PDB (not PDBQT yet).
+    """
+    protonated_pdb = out_dir / "receptor_protonated.pdb"
+
+    if (protonated_pdb.exists()
+            and protonated_pdb.stat().st_mtime >= pdb_path.stat().st_mtime):
+        log.info("    Protonated receptor cached: %s", protonated_pdb.name)
+        return protonated_pdb
+
+    # ── Try pdb2pqr (PROPKA) ──────────────────────────────────────────────
+    if _is_cmd("pdb2pqr") or _is_cmd("pdb2pqr30"):
+        cmd_name = "pdb2pqr30" if _is_cmd("pdb2pqr30") else "pdb2pqr"
+        pqr_path = out_dir / "receptor.pqr"
+        log.info("    pdb2pqr (PROPKA, pH %.1f, FF=%s) …", RECEPTOR_PH, RECEPTOR_FF)
+        r = _run([
+            cmd_name,
+            "--ff",        RECEPTOR_FF,
+            "--with-ph",   str(RECEPTOR_PH),
+            "--titration-state-method", "propka",
+            "--pdb-output", str(protonated_pdb),
+            str(pdb_path),
+            str(pqr_path),
+        ], check=False, capture=True)
+        if r.returncode == 0 and protonated_pdb.exists():
+            log.info("    Protonation done via pdb2pqr+PROPKA")
+            return protonated_pdb
+        else:
+            log.warning("    pdb2pqr failed (%s) — falling back to obabel",
+                        r.stderr.strip()[:120])
+
+    # ── Fallback: obabel ─────────────────────────────────────────────────
+    log.info("    Protonation via obabel (pH %.1f) …", RECEPTOR_PH)
+    _run([
+        "obabel", str(pdb_path),
+        "-O", str(protonated_pdb),
+        "-p", str(RECEPTOR_PH),
+        "--title", "receptor",
+    ])
+    return protonated_pdb
+
+
+def assign_receptor_charges_and_convert(protonated_pdb: Path, out_dir: Path) -> Path:
+    """
+    Stage 2 of receptor prep: assign Gasteiger charges and convert to PDBQT.
+    Returns path to receptor PDBQT (rigid, no flex split yet).
+    """
+    pdbqt_path = out_dir / "receptor_full.pdbqt"
+
+    if (pdbqt_path.exists()
+            and pdbqt_path.stat().st_mtime >= protonated_pdb.stat().st_mtime):
+        log.info("    Receptor PDBQT cached: %s", pdbqt_path.name)
+        return pdbqt_path
+
+    log.info("    Assigning Gasteiger charges → PDBQT …")
+    _run([
+        "obabel", str(protonated_pdb),
+        "-O", str(pdbqt_path),
+        "--partialcharge", "gasteiger",
+        "-d",   # merge nonpolar H
+        "--title", "receptor",
+    ])
+
+    if not pdbqt_path.exists() or pdbqt_path.stat().st_size == 0:
+        raise RuntimeError(f"Receptor PDBQT conversion failed: {pdbqt_path}")
+
+    return pdbqt_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FLEXIBLE-RESIDUE SPLITTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _meeko_flex_split(full_pdbqt: Path, flex_residues: List[str],
+                      out_dir: Path) -> Tuple[Path, Path]:
+    """
+    Use meeko's mk_prepare_receptor CLI to produce rigid + flex PDBQTs.
+    flex_residues format: ["A:TYR:50", "A:PHE:103"]
+    """
+    rigid_path = out_dir / "receptor_rigid.pdbqt"
+    flex_path  = out_dir / "receptor_flex.pdbqt"
+
+    if (rigid_path.exists() and flex_path.exists()
+            and rigid_path.stat().st_size > 0 and flex_path.stat().st_size > 0):
+        log.info("    Rigid/flex split cached")
+        return rigid_path, flex_path
+
+    # meeko format: "A:TYR:50_A:PHE:103"
+    flex_str  = "_".join(f.replace(":", ":") for f in flex_residues)
+    base_name = str(out_dir / "receptor")
+
+    mk_cmd = "mk_prepare_receptor.py"
+    if not _is_cmd(mk_cmd):
+        # Try as a module
+        mk_cmd = None
+
+    protonated_pdb = out_dir / "receptor_protonated.pdb"
+    if not protonated_pdb.exists():
+        protonated_pdb = full_pdbqt  # fallback
+
+    if mk_cmd:
+        r = _run([
+            mk_cmd,
+            "--pdb",     str(protonated_pdb),
+            "--flexres", flex_str,
+            "-o",        base_name,
+        ], check=False, capture=True)
+        if r.returncode == 0:
+            # meeko output filenames
+            for candidate in (
+                out_dir / "receptor_rigid.pdbqt",
+                out_dir / "receptor_flex.pdbqt",
+            ):
+                if not candidate.exists():
+                    # try alternate naming
+                    for f in out_dir.glob("*.pdbqt"):
+                        if "rigid" in f.stem:
+                            f.rename(rigid_path)
+                        elif "flex" in f.stem:
+                            f.rename(flex_path)
+            if rigid_path.exists() and flex_path.exists():
+                log.info("    Rigid/flex split done via mk_prepare_receptor")
+                return rigid_path, flex_path
+        log.warning("    mk_prepare_receptor failed — using Python PDBQT splitter")
+
+    # ── Python PDBQT splitter fallback ──────────────────────────────────
+    log.info("    Splitting PDBQT with built-in parser …")
+    _split_pdbqt_flex(full_pdbqt, flex_residues, rigid_path, flex_path)
+    return rigid_path, flex_path
+
+
+def _split_pdbqt_flex(full_pdbqt: Path, flex_residues: List[str],
+                      rigid_out: Path, flex_out: Path) -> None:
+    """
+    Minimal PDBQT splitter: extracts side-chain atoms of listed residues
+    into a flex PDBQT block; backbone + other residues go to rigid.
+
+    NOTE: This produces a simplified flex file (no BRANCH/ENDBRANCH tree).
+    For production runs with many flexible residues, prefer meeko or ADT.
+    """
+    # Parse flex residue specs
+    flex_keys: set = set()
+    for spec in flex_residues:
+        parts = spec.split(":")
+        if len(parts) == 3:
+            chain, resname, resnum = parts
+            flex_keys.add((chain.strip(), resname.strip().upper(), resnum.strip()))
+
+    backbone_atoms = {"N", "CA", "C", "O", "OXT", "H", "HA"}
+
+    rigid_lines: List[str] = []
+    flex_blocks: Dict[tuple, List[str]] = {k: [] for k in flex_keys}
+
+    with full_pdbqt.open() as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")):
+                chain   = line[21].strip()
+                resname = line[17:20].strip().upper()
+                resnum  = line[22:26].strip()
+                atom    = line[12:16].strip()
+                key     = (chain, resname, resnum)
+                if key in flex_keys and atom not in backbone_atoms:
+                    flex_blocks[key].append(line)
+                    continue
+            rigid_lines.append(line)
+
+    rigid_out.write_text("".join(rigid_lines))
+
+    flex_parts: List[str] = []
+    for key, lines in flex_blocks.items():
+        if not lines:
+            continue
+        chain, resname, resnum = key
+        flex_parts.append(f"BEGIN_RES {resname} {chain} {resnum}\n")
+        flex_parts.extend(lines)
+        flex_parts.append(f"END_RES {resname} {chain} {resnum}\n")
+
+    if flex_parts:
+        flex_out.write_text("".join(flex_parts))
+    else:
+        log.warning("    No flex atoms extracted — check FLEXIBLE_RESIDUES format")
+        # Write empty-ish file so Vina doesn't complain
+        flex_out.write_text("")
+
+    log.info("    Rigid: %d lines | Flex: %d blocks",
+             len(rigid_lines), len(flex_blocks))
+
+
+def prepare_receptor_full(pdb_path: Path, out_dir: Path) -> Tuple[Path, Optional[Path]]:
+    """
+    Full receptor preparation pipeline.
+    Returns (rigid_pdbqt, flex_pdbqt_or_None).
+    """
+    log.info("── Receptor preparation ──")
+
+    # 1. Protonation
+    protonated = protonate_receptor(pdb_path, out_dir)
+
+    # 2. Charge assignment + PDBQT
+    full_pdbqt = assign_receptor_charges_and_convert(protonated, out_dir)
+
+    # 3. Flexible residue split
+    if FLEXIBLE_RESIDUES:
+        log.info("    Flexible residues: %s", ", ".join(FLEXIBLE_RESIDUES))
+        rigid_pdbqt, flex_pdbqt = _meeko_flex_split(full_pdbqt, FLEXIBLE_RESIDUES, out_dir)
+        return rigid_pdbqt, flex_pdbqt
+    else:
+        log.info("    No flexible residues — rigid-only receptor")
+        rigid_pdbqt = out_dir / "receptor_rigid.pdbqt"
+        if not rigid_pdbqt.exists():
+            shutil.copy(full_pdbqt, rigid_pdbqt)
+        return rigid_pdbqt, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GRID BOX OPTIMIZATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_fpocket(pocket_dir: Path, pocket_rank: int) -> Tuple[Tuple, Tuple]:
+    """Parse fpocket *_info.txt to extract center + size of ranked pocket."""
+    info_files = sorted(pocket_dir.glob("*_info.txt"))
+    if not info_files:
+        raise FileNotFoundError(f"No fpocket info files in {pocket_dir}")
+
+    # fpocket numbers pockets 1-indexed by druggability score
+    target_idx = pocket_rank - 1
+    info_file = info_files[0]  # single info file with all pockets
+
+    pockets: List[Dict] = []
+    current: Dict = {}
+    with info_file.open() as fh:
+        for line in fh:
+            line = line.strip()
+            m = re.match(r"Pocket (\d+) :", line)
+            if m:
+                if current:
+                    pockets.append(current)
+                current = {"rank": int(m.group(1))}
+            elif ":" in line and current:
+                key, _, val = line.partition(":")
+                current[key.strip()] = val.strip()
+    if current:
+        pockets.append(current)
+
+    if target_idx >= len(pockets):
+        log.warning("Pocket %d not found; using pocket 1", pocket_rank)
+        target_idx = 0
+
+    p = pockets[target_idx]
+    try:
+        cx = float(p.get("x_barycenter", p.get("Barycenter x", 0)))
+        cy = float(p.get("y_barycenter", p.get("Barycenter y", 0)))
+        cz = float(p.get("z_barycenter", p.get("Barycenter z", 0)))
+    except (ValueError, KeyError):
+        raise ValueError(f"Cannot parse barycenter from fpocket pocket {pocket_rank}")
+
+    # Estimate box size from pocket volume: V = (4/3)π r³  → r = (3V/4π)^(1/3)
+    try:
+        vol = float(p.get("Volume", p.get("Real volume", 500)))
+        r   = (3 * vol / (4 * math.pi)) ** (1 / 3)
+        size = max(15.0, 2 * r + GRID_PADDING)
+    except (ValueError, KeyError):
+        size = 22.0
+
+    center = (round(cx, 3), round(cy, 3), round(cz, 3))
+    box    = (round(size, 1), round(size, 1), round(size, 1))
+    log.info("    fpocket pocket %d: center=%s  size=%s Å", pocket_rank, center, box)
+    return center, box
+
+
+def optimize_grid_fpocket(receptor_pdb: Path, pocket_rank: int,
+                          work_dir: Path) -> Tuple[Tuple, Tuple]:
+    """Run fpocket on the receptor and return (center, size) for pocket_rank."""
+    if not _is_cmd("fpocket"):
+        raise RuntimeError(
+            "fpocket not found. Install: sudo apt-get install fpocket  "
+            "or  pip install fpocket  (check fpocket repo for RPM)"
+        )
+
+    out_dir = work_dir / f"{receptor_pdb.stem}_out"
+    if not out_dir.exists():
+        log.info("    Running fpocket on %s …", receptor_pdb.name)
+        _run(["fpocket", "-f", str(receptor_pdb)], cwd=work_dir)
+    else:
+        log.info("    fpocket output cached: %s", out_dir.name)
+
+    return _parse_fpocket(out_dir, pocket_rank)
+
+
+def _pdbqt_centroid(pdbqt_path: Path) -> Tuple[float, float, float]:
+    """Geometric centroid of all ATOM/HETATM coordinates in a PDBQT/PDB file."""
+    xs, ys, zs = [], [], []
+    with pdbqt_path.open() as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    xs.append(float(line[30:38]))
+                    ys.append(float(line[38:46]))
+                    zs.append(float(line[46:54]))
+                except ValueError:
+                    continue
+    if not xs:
+        raise ValueError(f"No atom coordinates found in {pdbqt_path}")
+    span = lambda v: max(v) - min(v)
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    cz = sum(zs) / len(zs)
+    size = max(span(xs), span(ys), span(zs)) + 2 * GRID_PADDING
+    size = max(15.0, size)
+    return (round(cx, 3), round(cy, 3), round(cz, 3)), (round(size, 1),) * 3
+
+
+def resolve_grid(receptor_pdb: Path, work_dir: Path,
+                 cli_pocket: Optional[int] = None) -> Tuple[Tuple, Tuple]:
+    """
+    Determine grid center and size according to GRID_MODE.
+    Returns (center_xyz, size_xyz).
+    """
+    mode = GRID_MODE
+    if cli_pocket is not None:
+        mode = "fpocket"
+
+    if mode == "manual":
+        log.info("── Grid box: manual  center=%s  size=%s ──",
+                 GRID_CENTER, GRID_SIZE)
+        return GRID_CENTER, GRID_SIZE
+
+    if mode == "fpocket":
+        rank = cli_pocket or FPOCKET_POCKET
+        log.info("── Grid box: fpocket (pocket #%d) ──", rank)
+        return optimize_grid_fpocket(receptor_pdb, rank, work_dir)
+
+    if mode == "reference":
+        ref = Path(REFERENCE_LIGAND)
+        if not ref.exists():
+            log.warning("Reference ligand %s not found — falling back to manual", ref)
+            return GRID_CENTER, GRID_SIZE
+        log.info("── Grid box: reference ligand %s ──", ref.name)
+        center, size = _pdbqt_centroid(ref)
+        log.info("    center=%s  size=%s Å", center, size)
+        return center, size
+
+    log.warning("Unknown GRID_MODE '%s' — using manual", mode)
+    return GRID_CENTER, GRID_SIZE
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LIGAND PREPARATION  (charge assignment + PDBQT)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _am1bcc_charges(mol_path: Path, out_sdf: Path) -> bool:
+    """
+    Try to assign AM1-BCC charges via antechamber (AmberTools).
+    Returns True on success.
+    """
+    if not _is_cmd("antechamber"):
+        return False
+    mol2_tmp = out_sdf.with_suffix(".mol2")
+    r = _run([
+        "antechamber",
+        "-i",  str(mol_path),
+        "-fi", mol_path.suffix.lstrip(".").lower() or "mol2",
+        "-o",  str(mol2_tmp),
+        "-fo", "mol2",
+        "-c",  "bcc",
+        "-s",  "2",
+        "-nc", "0",
+    ], check=False, capture=True)
+    if r.returncode == 0 and mol2_tmp.exists():
+        shutil.move(str(mol2_tmp), str(out_sdf))
+        return True
+    log.debug("antechamber failed: %s", r.stderr[:200])
+    return False
+
+
+def _smiles_to_pdbqt_meeko(smiles: str, name: str, out_path: Path,
+                            charge_method: str) -> None:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from meeko import MoleculePreparation
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles!r}")
+    mol = Chem.AddHs(mol)
+    mol.SetProp("_Name", name)
+
+    p = AllChem.ETKDGv3()
+    p.randomSeed = 42
+    if AllChem.EmbedMolecule(mol, p) == -1:
+        AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+    AllChem.MMFFOptimizeMolecule(mol)
+
+    # AM1-BCC: write to SDF, run antechamber, reload
+    if charge_method in ("am1bcc", "auto"):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_sdf = Path(tmp) / f"{name}.sdf"
+            w = Chem.SDWriter(str(tmp_sdf))
+            w.write(mol)
+            w.close()
+            if _am1bcc_charges(tmp_sdf, tmp_sdf):
+                mol = Chem.MolFromMolFile(str(tmp_sdf), removeHs=False)
+                log.debug("    AM1-BCC charges applied to %s", name)
+            elif charge_method == "am1bcc":
+                raise RuntimeError("AM1-BCC requested but antechamber not available")
+            else:
+                log.debug("    AM1-BCC unavailable — using Gasteiger for %s", name)
+
+    preparator = MoleculePreparation()
+    mol_setups = preparator.prepare(mol)
+    pdbqt_str, is_ok, err = MoleculePreparation.write_pdbqt_string(
+        mol_setups[0], bad_charge_ok=True
+    )
+    if not is_ok:
+        log.warning("    Meeko note for %s: %s", name, err)
+    out_path.write_text(pdbqt_str)
+
+
+def _file_to_pdbqt_obabel(src: Path, out_path: Path, charge_method: str) -> None:
+    method = "gasteiger"
+    if charge_method in ("am1bcc", "auto") and _is_cmd("antechamber"):
+        with tempfile.TemporaryDirectory() as tmp:
+            charged = Path(tmp) / src.name
+            if _am1bcc_charges(src, charged):
+                src = charged
+                log.debug("    AM1-BCC charges applied to %s", src.name)
+    _run([
+        "obabel", str(src),
+        "-O", str(out_path),
+        "--gen3d",
+        "--partialcharge", method,
+        "-p", str(RECEPTOR_PH),
+    ])
+
+
+def prepare_ligand(ligand_spec: str, index: int, name_hint: str,
+                   out_dir: Path) -> Tuple[str, Path]:
+    """Prepare one ligand → PDBQT. Idempotent."""
+    charge_method = LIGAND_CHARGE_METHOD
+
+    if _is_smiles(ligand_spec):
+        name = name_hint or f"smiles_{index:03d}"
+        pdbqt_path = out_dir / f"{name}.pdbqt"
+        if pdbqt_path.exists() and pdbqt_path.stat().st_size > 0:
+            log.info("    [cached] %s", pdbqt_path.name)
+            return name, pdbqt_path
+        log.info("    Preparing SMILES '%s' (charge=%s) …", name, charge_method)
+        _smiles_to_pdbqt_meeko(ligand_spec, name, pdbqt_path, charge_method)
+    else:
+        src = Path(ligand_spec)
+        if not src.exists():
+            raise FileNotFoundError(f"Ligand file not found: {src}")
+        name = name_hint or src.stem
+        pdbqt_path = out_dir / f"{name}.pdbqt"
+        if (pdbqt_path.exists() and pdbqt_path.stat().st_size > 0
+                and pdbqt_path.stat().st_mtime >= src.stat().st_mtime):
+            log.info("    [cached] %s", pdbqt_path.name)
+            return name, pdbqt_path
+        log.info("    Preparing '%s' (%s, charge=%s) …",
+                 name, src.suffix, charge_method)
+        _file_to_pdbqt_obabel(src, pdbqt_path, charge_method)
+
+    if not pdbqt_path.exists() or pdbqt_path.stat().st_size == 0:
+        raise RuntimeError(f"Ligand PDBQT empty or missing: {pdbqt_path}")
+    return name, pdbqt_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOCKING ENGINES  (Python API → CLI fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dock_python_api(rigid_pdbqt: Path, flex_pdbqt: Optional[Path],
+                     ligand_pdbqt: Path, out_pdbqt: Path, log_path: Path,
+                     center: Tuple, size: Tuple, exhaustiveness: int,
+                     seed: int) -> str:
+    from vina import Vina
+
+    v = Vina(sf_name="vina", cpu=CPU_CORES or 0, verbosity=0, seed=seed)
+    v.set_receptor(str(rigid_pdbqt), str(flex_pdbqt) if flex_pdbqt else "")
+    v.set_ligand_from_file(str(ligand_pdbqt))
+    v.compute_vina_maps(center=list(center), box_size=list(size))
+    v.dock(exhaustiveness=exhaustiveness, n_poses=NUM_MODES)
+    v.write_poses(str(out_pdbqt), n_poses=NUM_MODES, overwrite=True)
+
+    energies = v.energies(n_poses=NUM_MODES)
+    lines = ["mode | affinity (kcal/mol) | rmsd lb | rmsd ub"]
+    for i, e in enumerate(energies, 1):
+        lines.append(f"  {i:2d}  |  {e[0]:+.3f}  |  {e[1]:.3f}  |  {e[2]:.3f}")
+    raw = "\n".join(lines)
+    log_path.write_text(raw)
+    return raw
+
+
+def _dock_cli(rigid_pdbqt: Path, flex_pdbqt: Optional[Path],
+              ligand_pdbqt: Path, out_pdbqt: Path, log_path: Path,
+              center: Tuple, size: Tuple, exhaustiveness: int,
+              seed: int) -> str:
+    if not _is_cmd("vina"):
+        raise RuntimeError("'vina' binary not found and Python API failed.")
+    cmd = [
+        "vina",
+        "--receptor",     str(rigid_pdbqt),
+        "--ligand",       str(ligand_pdbqt),
+        "--out",          str(out_pdbqt),
+        "--log",          str(log_path),
+        "--center_x",     str(center[0]),
+        "--center_y",     str(center[1]),
+        "--center_z",     str(center[2]),
+        "--size_x",       str(size[0]),
+        "--size_y",       str(size[1]),
+        "--size_z",       str(size[2]),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes",    str(NUM_MODES),
+        "--energy_range", str(ENERGY_RANGE),
+        "--seed",         str(seed),
+    ]
+    if flex_pdbqt and flex_pdbqt.exists() and flex_pdbqt.stat().st_size > 0:
+        cmd += ["--flex", str(flex_pdbqt)]
+    if CPU_CORES:
+        cmd += ["--cpu", str(CPU_CORES)]
+    r = _run(cmd, capture=True)
+    raw = r.stdout + r.stderr
+    log_path.write_text(raw)
+    return raw
+
+
+def single_dock(rigid_pdbqt: Path, flex_pdbqt: Optional[Path],
+                ligand_pdbqt: Path, out_pdbqt: Path, log_path: Path,
+                center: Tuple, size: Tuple,
+                exhaustiveness: int, seed: int) -> str:
+    """One docking call. Tries Python API first, falls back to CLI."""
+    try:
+        return _dock_python_api(rigid_pdbqt, flex_pdbqt, ligand_pdbqt,
+                                out_pdbqt, log_path, center, size,
+                                exhaustiveness, seed)
+    except Exception as e:
+        log.debug("  Python API error (%s) — using CLI", e)
+        return _dock_cli(rigid_pdbqt, flex_pdbqt, ligand_pdbqt,
+                         out_pdbqt, log_path, center, size,
+                         exhaustiveness, seed)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MULTIPLE RUNS  +  EXHAUSTIVENESS LADDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_modes(raw_log: str) -> List[Dict]:
+    modes = []
+    pattern = re.compile(
+        r"^\s*(\d+)\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)",
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(raw_log):
+        modes.append({
+            "mode":     int(m.group(1)),
+            "affinity": float(m.group(2)),
+            "rmsd_lb":  float(m.group(3)),
+            "rmsd_ub":  float(m.group(4)),
+        })
+    return modes
+
+
+def multi_run_dock(rigid_pdbqt: Path, flex_pdbqt: Optional[Path],
+                   ligand_pdbqt: Path, name: str, poses_dir: Path,
+                   logs_dir: Path, center: Tuple, size: Tuple) -> Dict:
+    """
+    Run NUM_RUNS independent docking jobs with different random seeds.
+    Aggregate all modes, take best-of-N by affinity.
+    Optionally run exhaustiveness ladder before the seed sweep.
+    Returns a result dict.
+    """
+    # ── Exhaustiveness ladder (optional) ────────────────────────────────────
+    chosen_exhaustiveness = EXHAUSTIVENESS
+    if LADDER_ENABLED and EXHAUSTIVENESS_LADDER:
+        log.info("    Exhaustiveness ladder: %s", EXHAUSTIVENESS_LADDER)
+        prev_best = None
+        for exh in sorted(EXHAUSTIVENESS_LADDER):
+            lad_out = poses_dir / f"{name}_ladder{exh}.pdbqt"
+            lad_log = logs_dir  / f"{name}_ladder{exh}.log"
+            if lad_out.exists() and lad_out.stat().st_size > 0:
+                raw = lad_log.read_text() if lad_log.exists() else ""
+            else:
+                log.info("      exh=%d …", exh)
+                raw = single_dock(rigid_pdbqt, flex_pdbqt, ligand_pdbqt,
+                                  lad_out, lad_log, center, size, exh, seed=42)
+            modes = _parse_modes(raw)
+            best = modes[0]["affinity"] if modes else None
+            if best is not None:
+                log.info("      exh=%-3d  best ΔG = %.3f kcal/mol", exh, best)
+                if prev_best is not None and abs(best - prev_best) < CONVERGENCE_THRESHOLD:
+                    log.info("      Converged at exhaustiveness=%d (Δ=%.3f < %.3f)",
+                             exh, abs(best - prev_best), CONVERGENCE_THRESHOLD)
+                    chosen_exhaustiveness = exh
+                    break
+                prev_best = best
+                chosen_exhaustiveness = exh
+        log.info("    Selected exhaustiveness: %d", chosen_exhaustiveness)
+
+    # ── Seed sweep ───────────────────────────────────────────────────────────
+    all_modes: List[Dict] = []
+    seeds = [42 + i * 137 for i in range(NUM_RUNS)]   # deterministic seeds
+
+    for run_idx, seed in enumerate(seeds, 1):
+        out_pdbqt = poses_dir / f"{name}_run{run_idx}.pdbqt"
+        log_path  = logs_dir  / f"{name}_run{run_idx}.log"
+
+        if out_pdbqt.exists() and out_pdbqt.stat().st_size > 0:
+            log.info("    [cached] run %d/%d (seed=%d)", run_idx, NUM_RUNS, seed)
+            raw = log_path.read_text() if log_path.exists() else ""
+        else:
+            log.info("    Run %d/%d  seed=%-6d  exh=%d …",
+                     run_idx, NUM_RUNS, seed, chosen_exhaustiveness)
+            raw = single_dock(rigid_pdbqt, flex_pdbqt, ligand_pdbqt,
+                              out_pdbqt, log_path, center, size,
+                              chosen_exhaustiveness, seed)
+
+        modes = _parse_modes(raw)
+        for m in modes:
+            m["run"]  = run_idx
+            m["seed"] = seed
+        all_modes.extend(modes)
+
+    if not all_modes:
+        return {
+            "name": name, "best_affinity": float("nan"),
+            "ki_uM": float("nan"), "classification": "ERROR",
+            "rmsd_lb": float("nan"), "rmsd_ub": float("nan"),
+            "num_modes": 0, "all_modes": [], "runs": NUM_RUNS,
+            "exhaustiveness_used": chosen_exhaustiveness,
+            "poses_dir": str(poses_dir),
+        }
+
+    # Sort all collected modes by affinity (most negative = best)
+    all_modes.sort(key=lambda m: m["affinity"])
+    best = all_modes[0]
+
+    # ── RMSD cluster — count how many runs agree on the best pose ────────────
+    cluster_count = sum(
+        1 for m in all_modes
+        if abs(m["affinity"] - best["affinity"]) < RMSD_CLUSTER_CUTOFF / 2
+    )
+    reproducibility = round(cluster_count / len(all_modes) * 100, 1)
+
+    affinity = best["affinity"]
+    ki       = _estimate_ki(affinity)
+    quality  = classify_affinity(affinity)
+
+    log.info("    Best: ΔG=%.3f kcal/mol  Ki≈%.4f µM  [%s]  Reproducibility=%.0f%%",
+             affinity, ki, quality, reproducibility)
+
+    return {
+        "name":                name,
+        "best_affinity":       affinity,
+        "ki_uM":               ki,
+        "classification":      quality,
+        "rmsd_lb":             best["rmsd_lb"],
+        "rmsd_ub":             best["rmsd_ub"],
+        "num_modes":           len(all_modes),
+        "runs":                NUM_RUNS,
+        "exhaustiveness_used": chosen_exhaustiveness,
+        "reproducibility_pct": reproducibility,
+        "all_modes":           all_modes,
+        "poses_dir":           str(poses_dir),
+        "best_run":            best["run"],
+        "best_seed":           best["seed"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCORING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _estimate_ki(affinity_kcal: float, temp_K: float = 298.15) -> float:
+    R = 1.987e-3   # kcal/(mol·K)
+    ki_molar = math.exp(affinity_kcal / (R * temp_K))
+    return ki_molar * 1e6   # µM
+
+
+def classify_affinity(affinity: float) -> str:
+    if affinity <= -10.0: return "Excellent"
+    if affinity <= -8.0:  return "Very Good"
+    if affinity <= -6.0:  return "Good"
+    if affinity <= -4.0:  return "Moderate"
+    return "Weak"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SUMMARY OUTPUT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_summary(results: List[Dict], out_dir: Path,
+                  center: Tuple, size: Tuple) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── CSV ─────────────────────────────────────────────────────────────────
+    csv_path = out_dir / "summary.csv"
+    fields   = [
+        "ligand", "best_affinity_kcal_mol", "ki_uM", "classification",
+        "best_rmsd_lb_A", "best_rmsd_ub_A", "total_modes",
+        "runs", "exhaustiveness_used", "reproducibility_pct",
+        "best_run", "best_seed", "poses_dir",
+    ]
+    with csv_path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for r in results:
+            w.writerow({
+                "ligand":                  r["name"],
+                "best_affinity_kcal_mol":  r.get("best_affinity", ""),
+                "ki_uM":                   f"{r['ki_uM']:.4f}" if r.get("ki_uM") == r.get("ki_uM") else "",
+                "classification":          r.get("classification", ""),
+                "best_rmsd_lb_A":          r.get("rmsd_lb", ""),
+                "best_rmsd_ub_A":          r.get("rmsd_ub", ""),
+                "total_modes":             r.get("num_modes", 0),
+                "runs":                    r.get("runs", 1),
+                "exhaustiveness_used":     r.get("exhaustiveness_used", EXHAUSTIVENESS),
+                "reproducibility_pct":     r.get("reproducibility_pct", ""),
+                "best_run":                r.get("best_run", 1),
+                "best_seed":               r.get("best_seed", 42),
+                "poses_dir":               r.get("poses_dir", ""),
+            })
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+    json_path = out_dir / "summary.json"
+    meta = {
+        "generated":    timestamp,
+        "protein":      PROTEIN_FILE,
+        "grid_mode":    GRID_MODE,
+        "grid_center":  center,
+        "grid_size":    size,
+        "receptor_ph":  RECEPTOR_PH,
+        "receptor_ff":  RECEPTOR_FF,
+        "charge_method":LIGAND_CHARGE_METHOD,
+        "flexible_residues": FLEXIBLE_RESIDUES,
+        "num_runs":     NUM_RUNS,
+        "exhaustiveness": EXHAUSTIVENESS,
+        "ladder_enabled": LADDER_ENABLED,
+    }
+    json_path.write_text(json.dumps({"meta": meta, "results": results}, indent=2))
+
+    # ── Human-readable TXT ───────────────────────────────────────────────────
+    txt_path = out_dir / "summary.txt"
+    sep      = "═" * 90
+    sub      = "─" * 90
+    hdr = (f"{'Ligand':<22} {'ΔG':>8} {'Ki(µM)':>10} {'Quality':<11}"
+           f" {'RMSD lb':>7} {'RMSD ub':>7} {'Modes':>6}"
+           f" {'Repro%':>7} {'Best Run':>9}")
+
+    sorted_results = sorted(
+        [r for r in results if not math.isnan(r.get("best_affinity", float("nan")))],
+        key=lambda r: r["best_affinity"]
+    ) + [r for r in results if math.isnan(r.get("best_affinity", float("nan")))]
+
+    lines = [
+        sep,
+        "  AutoDock Vina — Enhanced Docking Summary",
+        sep,
+        f"  Generated          : {timestamp}",
+        f"  Receptor           : {PROTEIN_FILE}",
+        f"  Protonation        : pdb2pqr + PROPKA  pH={RECEPTOR_PH}  FF={RECEPTOR_FF}",
+        f"  Charge method      : {LIGAND_CHARGE_METHOD}",
+        f"  Grid mode          : {GRID_MODE}  center={center}  size={size}",
+        f"  Flexible residues  : {', '.join(FLEXIBLE_RESIDUES) or 'none (rigid)'}",
+        f"  Runs per ligand    : {NUM_RUNS}  (seed sweep, best-of-N)",
+        f"  Exhaustiveness     : {EXHAUSTIVENESS}"
+        + (f"  [ladder: {EXHAUSTIVENESS_LADDER}]" if LADDER_ENABLED else ""),
+        sub,
+        hdr,
+        sub,
+    ]
+
+    for r in sorted_results:
+        aff  = f"{r['best_affinity']:.3f}" if not math.isnan(r.get("best_affinity", float("nan"))) else "  ERROR"
+        ki   = f"{r['ki_uM']:.4f}"         if not math.isnan(r.get("ki_uM", float("nan")))         else "  N/A"
+        repro= f"{r.get('reproducibility_pct', ''):>6.1f}" if r.get("reproducibility_pct") else "    N/A"
+        lines.append(
+            f"  {r['name']:<20} {aff:>8} {ki:>10} {r.get('classification',''):11}"
+            f" {r.get('rmsd_lb', 0):>7.3f} {r.get('rmsd_ub', 0):>7.3f}"
+            f" {r.get('num_modes', 0):>6} {repro:>7}%"
+            f" {str(r.get('best_run', ''))+'/'+ str(r.get('runs',1)):>9}"
+        )
+
+    lines += [
+        sep,
+        "  Sorted by ΔG (kcal/mol) — most negative = strongest predicted binding.",
+        "  Ki estimated via ΔG = RT·ln(Ki) at 298.15 K.",
+        "  Reproducibility = % of all poses within RMSD_CLUSTER_CUTOFF/2 of best.",
+        "  Per-ligand PDBQT poses and Vina logs are in ligand sub-directories.",
+        sep,
+    ]
+    txt_path.write_text("\n".join(lines) + "\n")
+
+    log.info("Summaries written:")
+    for p in (csv_path, json_path, txt_path):
+        log.info("  %s", p)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="AutoDock Vina Enhanced Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--skip-install", action="store_true",
+                        help="Skip all system/Python package installation")
+    parser.add_argument("--pocket", type=int, default=None,
+                        help="Override GRID_MODE=fpocket and use pocket #N")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    log.info("╔═══════════════════════════════════════════════════╗")
+    log.info("║  AutoDock Vina — Enhanced Docking Pipeline        ║")
+    log.info("╚═══════════════════════════════════════════════════╝")
+
+    # ── Preflight ──────────────────────────────────────────────────────────
+    protein_path = Path(PROTEIN_FILE)
+    if not protein_path.exists():
+        log.error("Receptor PDB not found: %s", protein_path)
+        return 1
+    if not LIGANDS:
+        log.error("LIGANDS list is empty.")
+        return 1
+
+    names = list(SMILES_NAMES) + [""] * max(0, len(LIGANDS) - len(SMILES_NAMES))
+
+    # ── Output directories ─────────────────────────────────────────────────
+    out_dir     = Path(OUTPUT_DIR)
+    rec_dir     = out_dir / "receptor"
+    ligands_dir = out_dir / "ligands"
+    summary_dir = out_dir / "summary"
+
+    for d in (out_dir, rec_dir, ligands_dir, summary_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    log.info("Output: %s", out_dir.resolve())
+
+    # ── 1. Install dependencies ────────────────────────────────────────────
+    if not args.skip_install:
+        os_family = detect_os()
+        log.info("OS family: %s", os_family)
+        install_system_deps(os_family)
+        install_python_deps()
+    else:
+        log.info("Skipping dependency install (--skip-install)")
+
+    # ── 2. Receptor: protonation + charge + optional flex split ───────────
+    rigid_pdbqt, flex_pdbqt = prepare_receptor_full(protein_path, rec_dir)
+
+    # ── 3. Grid box resolution ─────────────────────────────────────────────
+    center, size = resolve_grid(protein_path, rec_dir, args.pocket)
+
+    # ── 4. Ligand loop ─────────────────────────────────────────────────────
+    results: List[Dict] = []
+
+    for idx, (spec, hint) in enumerate(zip(LIGANDS, names), start=1):
+        log.info("══ Ligand %d/%d ══════════════════════════════════════",
+                 idx, len(LIGANDS))
+
+        try:
+            # 4a. Prepare ligand PDBQT
+            name, ligand_pdbqt = prepare_ligand(spec, idx, hint, ligands_dir)
+
+            # 4b. Per-ligand sub-directories
+            lig_poses_dir = out_dir / "poses" / name
+            lig_logs_dir  = out_dir / "logs"  / name
+            lig_poses_dir.mkdir(parents=True, exist_ok=True)
+            lig_logs_dir.mkdir(parents=True, exist_ok=True)
+
+            # 4c. Multi-run docking
+            result = multi_run_dock(
+                rigid_pdbqt, flex_pdbqt, ligand_pdbqt, name,
+                lig_poses_dir, lig_logs_dir, center, size,
+            )
+            results.append(result)
+
+        except Exception as exc:
+            log.error("  FAILED: %s — %s", type(exc).__name__, exc)
+            results.append({
+                "name":           hint or f"ligand_{idx:03d}",
+                "best_affinity":  float("nan"),
+                "ki_uM":          float("nan"),
+                "classification": "ERROR",
+                "rmsd_lb":        float("nan"),
+                "rmsd_ub":        float("nan"),
+                "num_modes":      0,
+                "all_modes":      [],
+                "runs":           NUM_RUNS,
+                "exhaustiveness_used": EXHAUSTIVENESS,
+                "error":          str(exc),
+            })
+
+    # ── 5. Summary ─────────────────────────────────────────────────────────
+    log.info("══ Summary ═══════════════════════════════════════════")
+    if results:
+        write_summary(results, summary_dir, center, size)
+
+    ok  = [r for r in results if r.get("num_modes", 0) > 0]
+    err = [r for r in results if r.get("num_modes", 0) == 0]
+
+    log.info("Done: %d succeeded  |  %d failed", len(ok), len(err))
+    if ok:
+        best = min(ok, key=lambda r: r["best_affinity"])
+        log.info("Best binder: %s  ΔG=%.3f kcal/mol  Ki≈%.4f µM  [%s]",
+                 best["name"], best["best_affinity"],
+                 best["ki_uM"], best["classification"])
+    log.info("All output in: %s", out_dir.resolve())
+
+    return 0 if not err else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
